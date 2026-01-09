@@ -10,6 +10,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 from homeassistant.components import camera
+from homeassistant.components.mqtt import async_subscribe
 from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 
@@ -175,7 +176,7 @@ class ValetudoSensorManager:
         if device_id not in self._sensors:
             self._sensors[device_id] = []
 
-        sensor_classes = [ValetudoEstimatedSegmentSensor]
+        sensor_classes = [ValetudoEstimatedSegmentSensor, ValetudoDetectedObstacleSensor]
 
         new_entities = []
         for Cls in sensor_classes:
@@ -316,3 +317,173 @@ class ValetudoEstimatedSegmentSensor(SensorEntity):
         approximated_segment = approximate_segment(unpacked_pixels)
 
         return approximated_segment
+    
+class ValetudoDetectedObstacleSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Detected obstacles"
+    _attr_icon = "mdi:floor-plan"
+    _attr_should_poll = False
+
+    def __init__(self, hass: HomeAssistant, device: dr.DeviceEntry, map_entity_id: str, vacuum_entity_id: str):
+        self.hass = hass
+        self._map_entity_id = map_entity_id
+        self._vacuum_entity_id = vacuum_entity_id
+        self._device_info = device
+        # Extract robot identifier from device registry (usually the second part of the tuple)
+        self._robot_id = next(iter(device.identifiers))[1]
+        self._robot_ip = "unknown"  # Default until MQTT reports it
+        self._attr_unique_id = f"{device.id}_detected_obstacles"
+        self._attr_device_info = {
+            "connections": device.connections,
+            "identifiers": device.identifiers,
+        }
+        self._attr_native_value = None
+        self._attr_extra_state_attributes = {"obstacles": []}
+
+        self._attr_available = False
+
+        self._last_nonce = None
+        self._process_lock = asyncio.Lock()
+        self._timer_unsub = None
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, [self._vacuum_entity_id], self._handle_vacuum_update
+            )
+        )
+        # 1. Track Vacuum State (for polling frequency)
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass, [self._vacuum_entity_id], self._handle_vacuum_update
+            )
+        )
+
+        # 2. Subscribe to IP Address updates via MQTT
+        # Topic: valetudo/<robot_id>/WifiConfigurationCapability/ips
+        ip_topic = f"valetudo/{self._robot_id}/WifiConfigurationCapability/ips"
+        
+        @callback
+        def _ip_received(msg):
+            self._robot_ip = msg.payload
+            _LOGGER.debug(f"Updated IP for {self._robot_id}: {self._robot_ip}")
+
+        self.async_on_remove(
+            await async_subscribe(self.hass, ip_topic, _ip_received)
+        )
+        self.async_on_remove(self._stop_timer)
+
+        state_obj = self.hass.states.get(self._vacuum_entity_id)
+        initial_state = state_obj.state if state_obj else STATE_UNKNOWN
+        self._handle_state_update(initial_state)
+
+    @callback
+    def _handle_vacuum_update(self, event):
+        new_state = event.data.get("new_state")
+        state_str = new_state.state if new_state else STATE_UNKNOWN
+        self._handle_state_update(state_str)
+
+    def _handle_state_update(self, state: str):
+        if state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self._attr_available = False
+            self._stop_timer()
+            self._last_nonce = None
+            self.async_write_ha_state()
+            return
+
+        was_unavailable = not self._attr_available
+        self._attr_available = True
+
+        target_interval = INTERVAL_ACTIVE if state in ACTIVE_STATES else INTERVAL_IDLE
+        self._schedule_timer(target_interval)
+
+        if was_unavailable or target_interval == INTERVAL_ACTIVE:
+            self.hass.async_create_task(self._check_map_update(None))
+
+    def _schedule_timer(self, interval: timedelta):
+        self._stop_timer()
+        self._timer_unsub = async_track_time_interval(
+            self.hass, self._check_map_update, interval
+        )
+
+    def _stop_timer(self):
+        if self._timer_unsub:
+            self._timer_unsub()
+            self._timer_unsub = None
+
+    async def _check_map_update(self, _):
+        """Called by timer to check the camera entity for new data."""
+        if self._process_lock.locked():
+            return
+
+        async with self._process_lock:
+            try:
+                image_obj = await camera.async_get_image(self.hass, self._map_entity_id)
+                image_bytes = image_obj.content
+            except Exception:
+                return
+
+            try:
+                raw_map_data = await self.hass.async_add_executor_job(
+                    extract_map_from_image,
+                    image_bytes
+                )
+            except Exception:
+                return
+
+            if not raw_map_data:
+                return
+
+            current_nonce = raw_map_data.get("metaData", {}).get("nonce")
+            if current_nonce and current_nonce == self._last_nonce:
+                return
+
+            self._last_nonce = current_nonce
+
+            try:
+                obstacle_list = await self.hass.async_add_executor_job(
+                    self._update_obstacles,
+                    raw_map_data
+                )
+                if obstacle_list:
+                    # Update the state (count of obstacles) and the detailed attribute list
+                    self._attr_native_value = len(obstacle_list)
+                    self._attr_extra_state_attributes = {"obstacles": obstacle_list}
+                else:
+                    self._attr_native_value = "Unknown"
+                    self._attr_extra_state_attributes = {}
+               
+                self.async_write_ha_state()
+            except Exception:
+                return
+            
+    def _update_obstacles(self, map_data):
+        """Extract obstacle entities from the map JSON structure."""
+        # Valetudo Map Schema stores points of interest in 'entities'
+        entities = map_data.get("entities", [])
+        obstacle_list = []
+
+        for entity in entities:
+            # We look specifically for 'obstacle' types
+            if entity.get("type") == "obstacle":
+                points = entity.get("points", [])
+                meta = entity.get("metaData", {})
+                obj_id = meta.get("id")
+                
+                # Build the dynamic link using the auto-discovered IP
+                image_link = ""
+                if obj_id and self._robot_ip != "unknown":
+                    image_link = f"http://{self._robot_ip}/api/v2/robot/capabilities/ObstacleImagesCapability/img/{obj_id}"
+                
+                obstacle_list.append({
+                    "label": meta.get("label", "Unknown Object"),
+                    "x": points[0] if len(points) > 0 else 0,
+                    "y": points[1] if len(points) > 1 else 0,
+                    "confidence": meta.get("confidence", 100),
+                    "id": obj_id,
+                    "link": image_link
+                })
+        return obstacle_list
+        
+
+
